@@ -119,41 +119,10 @@ class IFindProvider:
     async def realtime(self, codes: list[str], indicators: str):
         if not codes:
             return {"tables": []}
-        return await self._post("real_time_quotation", {
-            "codes": ",".join(codes),
-            "indicators": indicators,
-        })
-
-    async def overview(self):
-        codes = ["000001.SH", "399001.SZ", "399006.SZ"]
-        raw = await self.realtime(codes, "latest,changeRatio,amount")
-        rows = self.rows_from_response(raw)
-        names = {"000001.SH": "上证指数", "399001.SZ": "深证成指", "399006.SZ": "创业板指"}
-        indexes = []
-        for r in rows:
-            code = str(r.get("code") or r.get("thscode") or "")
-            indexes.append({
-                "name": names.get(code, code),
-                "code": code,
-                "value": r.get("latest"),
-                "change": r.get("changeRatio"),
-            })
-        return {
-            "indexes": indexes,
-            "up": None,
-            "down": None,
-            "limit_up": None,
-            "limit_down": None,
-            "turnover_amount": None,
-            "sentiment": None,
-            "updated_at": time.strftime("%H:%M:%S"),
-        }
+        return await self._post("real_time_quotation", {"codes": ",".join(codes), "indicators": indicators})
 
     async def wencai(self, query: str):
-        return await self._post("smart_stock_picking", {
-            "searchstring": query,
-            "searchtype": "stock",
-        })
+        return await self._post("smart_stock_picking", {"searchstring": query, "searchtype": "stock"})
 
     @staticmethod
     def _pick(row: dict[str, Any], *needles: str):
@@ -168,27 +137,32 @@ class IFindProvider:
         if value is None or value == "":
             return None
         if isinstance(value, (int, float)):
-            return float(value)
-        s = str(value).replace(",", "").strip()
-        m = re.search(r"-?\d+(?:\.\d+)?", s)
-        if not m:
-            return None
-        n = float(m.group())
+            n = float(value)
+            raw = ""
+        else:
+            raw = str(value).replace(",", "").strip()
+            m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
+            if not m:
+                return None
+            try:
+                n = float(m.group())
+            except ValueError:
+                return None
         if target == "yi":
-            if "万亿" in s:
+            if "万亿" in raw:
                 n *= 10000
-            elif "亿" in s:
+            elif "亿" in raw:
                 pass
-            elif "万" in s:
+            elif "万" in raw:
                 n /= 10000
             else:
                 n /= 100000000
         elif target == "wan":
-            if "万亿" in s:
+            if "万亿" in raw:
                 n *= 100000000
-            elif "亿" in s:
+            elif "亿" in raw:
                 n *= 10000
-            elif "万" in s:
+            elif "万" in raw:
                 pass
             else:
                 n /= 10000
@@ -199,13 +173,15 @@ class IFindProvider:
         code = row.get("code") or row.get("thscode") or row.get("THSCODE") or cls._pick(row, "股票代码") or cls._pick(row, "证券代码")
         name = cls._pick(row, "股票简称") or cls._pick(row, "证券简称") or cls._pick(row, "股票名称") or row.get("name") or code
         industry = cls._pick(row, "同花顺行业") or cls._pick(row, "所属行业") or cls._pick(row, "行业") or "—"
-        price = row.get("latest") if row.get("latest") is not None else cls._pick(row, "最新价")
+        price = row.get("latest")
+        if price is None:
+            price = cls._pick(row, "最新价") or cls._pick(row, "收盘价") or cls._pick(row, "现价")
         change = row.get("changeRatio") if row.get("changeRatio") is not None else cls._pick(row, "涨跌幅")
         amount = row.get("amount") if row.get("amount") is not None else cls._pick(row, "成交额")
         turnover = cls._pick(row, "换手率")
         volume_ratio = cls._pick(row, "量比")
-        main_inflow = cls._pick(row, "主力", "净流入") or cls._pick(row, "主力资金", "流入")
         main_inflow_rate = cls._pick(row, "主力", "净流入率")
+        main_inflow = cls._pick(row, "主力", "净流入") or cls._pick(row, "主力资金", "流入")
         if isinstance(main_inflow, str) and "%" in main_inflow:
             main_inflow = None
         out = {
@@ -236,44 +212,93 @@ class IFindProvider:
         rows = self.rows_from_response(raw)
         return [self.normalize_stock_row(r) for r in rows if isinstance(r, dict)]
 
-    async def stocks(self):
-        cache_key = "stocks"
+    async def _market_snapshot(self) -> list[dict[str, Any]]:
+        cache_key = "market_snapshot"
         cached = self._cache.get(cache_key)
-        if cached and time.time() - cached[0] < 20:
+        if cached and time.time() - cached[0] < 300:
             return cached[1]
-        try:
-            query = "A股，非ST，最新价，今日涨跌幅，今日成交额，今日换手率，今日量比，今日主力净流入，所属同花顺行业"
-            rows = await self.wencai_stocks(query)
-            rows = [r for r in rows if r.get("code")]
-            if rows:
-                rows.sort(key=lambda x: (x.get("main_inflow") or 0, x.get("amount") or 0), reverse=True)
-                result = rows[:300]
-                self._cache[cache_key] = (time.time(), result)
-                return result
-        except Exception:
-            pass
-        raw = await self.realtime(IFIND_WATCHLIST, "latest,changeRatio,amount")
+        query = "A股，股票代码，股票简称，收盘价，今日涨跌幅，今日成交额，今日换手率，今日量比，今日主力净流入，所属同花顺行业"
+        rows = await self.wencai_stocks(query)
+        rows = [r for r in rows if r.get("code")]
+        self._cache[cache_key] = (time.time(), rows)
+        return rows
+
+    async def overview(self):
+        codes = ["000001.SH", "399001.SZ", "399006.SZ"]
+        raw = await self.realtime(codes, "latest,changeRatio,amount")
         rows = self.rows_from_response(raw)
-        result = []
+        names = {"000001.SH": "上证指数", "399001.SZ": "深证成指", "399006.SZ": "创业板指"}
+        indexes = []
         for r in rows:
-            item = self.normalize_stock_row(r)
-            item["reasons"] = ["iFinD 实时行情；问财字段暂未返回"]
-            result.append(item)
-        self._cache[cache_key] = (time.time(), result)
-        return result
+            code = str(r.get("code") or r.get("thscode") or "")
+            indexes.append({"name": names.get(code, code), "code": code, "value": r.get("latest"), "change": r.get("changeRatio")})
+
+        up = down = limit_up = limit_down = 0
+        turnover_amount = None
+        sentiment = None
+        try:
+            stocks = await self._market_snapshot()
+            valid_changes = [s.get("change") for s in stocks if s.get("change") is not None]
+            up = sum(1 for x in valid_changes if x > 0)
+            down = sum(1 for x in valid_changes if x < 0)
+            limit_up = sum(1 for s in stocks if s.get("change") is not None and s.get("change") >= 9.5)
+            limit_down = sum(1 for s in stocks if s.get("change") is not None and s.get("change") <= -9.5)
+            total_yi = sum(float(s.get("amount") or 0) for s in stocks)
+            turnover_amount = round(total_yi / 10000, 2)
+            total = up + down
+            sentiment = round((up / total) * 100, 1) if total else None
+        except Exception:
+            up = down = limit_up = limit_down = None
+
+        return {
+            "indexes": indexes,
+            "up": up,
+            "down": down,
+            "limit_up": limit_up,
+            "limit_down": limit_down,
+            "turnover_amount": turnover_amount,
+            "sentiment": sentiment,
+            "updated_at": time.strftime("%H:%M:%S"),
+        }
+
+    async def stocks(self):
+        try:
+            rows = await self._market_snapshot()
+            rows = list(rows)
+            rows.sort(key=lambda x: (x.get("main_inflow") or 0, x.get("amount") or 0), reverse=True)
+            return rows[:300]
+        except Exception:
+            raw = await self.realtime(IFIND_WATCHLIST, "latest,changeRatio,amount")
+            rows = self.rows_from_response(raw)
+            result = []
+            for r in rows:
+                item = self.normalize_stock_row(r)
+                item["reasons"] = ["iFinD 实时行情；问财字段暂未返回"]
+                result.append(item)
+            return result
 
     async def fund_industries(self):
         try:
-            rows = await self.wencai_stocks("A股，非ST，今日主力净流入前200名，今日主力净流入，所属同花顺行业")
+            rows = await self._market_snapshot()
             agg: dict[str, dict[str, float]] = {}
             for r in rows:
                 industry = r.get("industry") or "未分类"
                 if industry == "—":
                     continue
-                bucket = agg.setdefault(industry, {"main_inflow": 0.0, "count": 0.0})
+                bucket = agg.setdefault(industry, {"main_inflow": 0.0, "amount": 0.0, "up": 0.0, "count": 0.0})
                 bucket["main_inflow"] += float(r.get("main_inflow") or 0)
+                bucket["amount"] += float(r.get("amount") or 0)
                 bucket["count"] += 1
-            result = [{"industry": k, "main_inflow": v["main_inflow"], "amount": 0, "up_ratio": 0} for k, v in agg.items()]
+                if (r.get("change") or 0) > 0:
+                    bucket["up"] += 1
+            result = []
+            for industry, v in agg.items():
+                result.append({
+                    "industry": industry,
+                    "main_inflow": v["main_inflow"],
+                    "amount": v["amount"],
+                    "up_ratio": round(v["up"] / v["count"] * 100, 1) if v["count"] else 0,
+                })
             result.sort(key=lambda x: x["main_inflow"], reverse=True)
             return result[:20]
         except Exception:
@@ -286,13 +311,9 @@ class IFindProvider:
             return None
         r = rows[0]
         item = self.normalize_stock_row(r)
-        item.update({
-            "code": code,
-            "reasons": [f"开 {r.get('open')} / 高 {r.get('high')} / 低 {r.get('low')}", "iFinD 实时行情"],
-            "fund_timeline": [],
-        })
+        item.update({"code": code, "reasons": [f"开 {r.get('open')} / 高 {r.get('high')} / 低 {r.get('low')}", "iFinD 实时行情"], "fund_timeline": []})
         try:
-            extra = await self.wencai_stocks(f"{code}，最新价，今日涨跌幅，今日成交额，今日换手率，今日量比，今日主力净流入，所属同花顺行业")
+            extra = await self.wencai_stocks(f"{code}，收盘价，今日涨跌幅，今日成交额，今日换手率，今日量比，今日主力净流入，今日主力净流入率，所属同花顺行业")
             if extra:
                 merged = extra[0]
                 merged["reasons"] = item["reasons"] + ["问财扩展字段"]
@@ -311,12 +332,14 @@ class IFindProvider:
             "realtime_rows": self.rows_from_response(realtime_raw)[:2],
         }
         try:
-            wc_raw = await self.wencai("300033.SZ，最新价，今日涨跌幅，今日成交额，今日换手率，今日量比")
+            wc_raw = await self.wencai("300033.SZ，收盘价，今日涨跌幅，今日成交额，今日换手率，今日量比，今日主力净流入，今日主力净流入率，所属同花顺行业")
+            preview = self.rows_from_response(wc_raw)[:2]
             diag.update({
                 "wencai_errorcode": wc_raw.get("errorcode"),
                 "wencai_top_keys": list(wc_raw.keys()),
                 "wencai_table_count": len(wc_raw.get("tables") or []),
-                "wencai_rows_preview": self.rows_from_response(wc_raw)[:2],
+                "wencai_rows_preview": preview,
+                "wencai_normalized_preview": [self.normalize_stock_row(x) for x in preview],
                 "wencai_errmsg": wc_raw.get("errmsg"),
             })
         except Exception as e:

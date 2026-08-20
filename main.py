@@ -12,7 +12,7 @@ from app.ifind_provider import IFindProvider
 from app.strategy import build_wencai_query, matches
 
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title="A股量化分析工作台", version="0.1.0")
+app = FastAPI(title="A股量化分析工作台", version="0.1.1")
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 provider = IFindProvider() if DATA_MODE == "ifind" else MockProvider()
 
@@ -59,12 +59,18 @@ async def funds():
 
 @app.get("/api/stocks")
 async def stocks():
-    return await provider.stocks()
+    try:
+        return await provider.stocks()
+    except Exception as e:
+        raise HTTPException(502, str(e))
 
 
 @app.get("/api/stock/{code}")
 async def stock(code: str):
-    item = await provider.stock_detail(code)
+    try:
+        item = await provider.stock_detail(code)
+    except Exception as e:
+        raise HTTPException(502, str(e))
     if not item:
         raise HTTPException(404, "未找到股票")
     return item
@@ -75,12 +81,25 @@ async def screener(req: ScreenRequest):
     c = req.model_dump()
     query = build_wencai_query(c)
     if DATA_MODE == "ifind":
-        raw = await provider.wencai(query)
-        return {"mode":"ifind", "query":query, "raw":raw, "results":[]}
+        try:
+            results = await provider.wencai_stocks(query)
+            return {"mode": "ifind", "query": query, "count": len(results), "results": results}
+        except Exception as e:
+            raise HTTPException(502, f"问财筛选失败: {e}")
     rows = await provider.stocks()
     results = [s for s in rows if matches(s, c)]
     results.sort(key=lambda x: (x.get("score", 0), x.get("main_inflow", 0)), reverse=True)
-    return {"mode":"demo", "query":query, "count":len(results), "results":results}
+    return {"mode": "demo", "query": query, "count": len(results), "results": results}
+
+
+@app.get("/api/ifind/diagnose")
+async def ifind_diagnose():
+    if DATA_MODE != "ifind":
+        return {"mode": DATA_MODE, "message": "当前不是 iFinD 模式"}
+    try:
+        return await provider.diagnose()
+    except Exception as e:
+        raise HTTPException(502, str(e))
 
 
 @app.get("/api/presets")
